@@ -149,6 +149,8 @@ def _detect_provider(url: str) -> str:
         return "openrouter"
     if "groq.com" in u:
         return "groq"
+    if "githubcopilot.com" in u:
+        return "copilot"
     return "openai"
 
 
@@ -175,6 +177,7 @@ def _provider_label(url: str) -> str:
     if "googleapis.com" in u or "generativelanguage" in u: return "Google"
     if "together.xyz" in u or "together.ai" in u: return "Together"
     if "fireworks.ai" in u: return "Fireworks"
+    if "githubcopilot.com" in u: return "GitHub Copilot"
     if "ollama" in u or ":11434" in u: return "Ollama"
     if "localhost" in u or "127.0.0.1" in u: return "local endpoint"
     try:

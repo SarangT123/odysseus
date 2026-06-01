@@ -1,5 +1,6 @@
 # routes/model_routes.py
 """Routes for model and provider management."""
+import os
 import re
 import uuid
 import json
@@ -72,6 +73,10 @@ _PROVIDER_CURATED = {
     "xai": [
         "grok-4.3", "grok-4", "grok-4-fast", "grok-3", "grok-3-fast",
     ],
+    "copilot": [
+        "gpt-4o", "claude-sonnet-4", "claude-sonnet-4-20250514",
+        "gemini-2.5-flash-001",
+    ],
 }
 
 # Map URL substrings → curated-list keys for providers whose _detect_provider()
@@ -87,6 +92,7 @@ _URL_TO_CURATED = {
     "generativelanguage.googleapis.com": "google",
     "api.x.ai": "xai",
     "openrouter.ai": "openrouter",
+    "api.githubcopilot.com": "copilot",
 }
 
 
@@ -251,7 +257,9 @@ def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> Lis
     For Anthropic, queries their /v1/models API, falling back to hardcoded list."""
     from src.endpoint_resolver import resolve_url
     base = resolve_url(_normalize_base(base_url))
-    if _detect_provider(base) == "anthropic":
+    # Detect provider BEFORE checking curated lists — some providers have no /models endpoint
+    provider = _detect_provider(base)
+    if provider == "anthropic":
         # Try Anthropic's /v1/models endpoint first
         url = _anthropic_api_root(base) + "/v1/models"
         headers = {"anthropic-version": "2023-06-01"}
@@ -276,6 +284,14 @@ def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> Lis
                 return []
             logger.warning(f"Anthropic /v1/models failed, using hardcoded list: {e}")
         return list(ANTHROPIC_MODELS)
+    # GitHub Copilot has no /models endpoint — return curated list directly
+    if provider == "copilot":
+        curated_key = _match_provider_curated(base, "copilot")
+        fallback = _PROVIDER_CURATED.get(curated_key) if curated_key else None
+        if fallback:
+            logger.info(f"GitHub Copilot endpoint detected, using curated models: {fallback}")
+            return list(fallback)
+        return []
     url = base + "/models"
     headers = {}
     if api_key:
@@ -1378,5 +1394,139 @@ def setup_model_routes(model_discovery):
         settings["disabled_tools"] = body.disabled
         _save_settings(settings)
         return {"ok": True, "disabled": body.disabled}
+
+    # ── GitHub Copilot device auth flow ──
+
+    # GitHub OAuth device flow client_id (public — used by gh CLI and many tools)
+    _COPILOT_CLIENT_ID = os.getenv("COPILOT_CLIENT_ID", "178c6fc778ccc68e1d6a")
+    # In-memory pending auth sessions: session_id → {device_code, interval, created_at}
+    _copilot_auth_sessions: Dict[str, Dict] = {}
+
+    @router.post("/copilot-auth/start")
+    async def copilot_auth_start(request: Request):
+        """Start GitHub device authorization flow for Copilot.
+
+        Returns a user_code the user enters at github.com/login/device.
+        The caller then polls /copilot-auth/poll until the token is ready.
+        """
+        require_admin(request)
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://github.com/login/device/code",
+                data={
+                    "client_id": _COPILOT_CLIENT_ID,
+                    "scope": "read:user",
+                },
+                headers={"Accept": "application/json"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                raise HTTPException(502, f"GitHub device code request failed: {resp.text}")
+            body = resp.json()
+            if "error" in body:
+                raise HTTPException(502, f"GitHub OAuth error: {body.get('error_description', body['error'])}")
+
+        session_id = str(uuid.uuid4())
+        _copilot_auth_sessions[session_id] = {
+            "device_code": body["device_code"],
+            "interval": body.get("interval", 5),
+            "created_at": _time.time(),
+        }
+
+        return {
+            "session_id": session_id,
+            "user_code": body["user_code"],
+            "verification_uri": body["verification_uri"],
+            "interval": body.get("interval", 5),
+        }
+
+    @router.post("/copilot-auth/poll")
+    async def copilot_auth_poll(request: Request):
+        """Poll for a completed GitHub device authorization.
+
+        JSON body: {"session_id": "..."}
+        Returns:
+          {"status": "pending"}  — user hasn't authorized yet
+          {"status": "complete", "endpoint_id": "..."}  — token obtained, endpoint created
+          {"status": "error", "error": "..."} — something went wrong
+        """
+        require_admin(request)
+        from src.auth_helpers import get_current_user as _gcu
+
+        body = await request.json()
+        session_id = (body or {}).get("session_id", "")
+        if not session_id or session_id not in _copilot_auth_sessions:
+            raise HTTPException(400, "Invalid or expired session_id")
+
+        sess = _copilot_auth_sessions[session_id]
+        device_code = sess["device_code"]
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://github.com/login/oauth/access_token",
+                data={
+                    "client_id": _COPILOT_CLIENT_ID,
+                    "device_code": device_code,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                },
+                headers={"Accept": "application/json"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                raise HTTPException(502, f"GitHub token request failed: {resp.text}")
+            body = resp.json()
+
+        if "error" in body:
+            err = body["error"]
+            if err in ("authorization_pending", "slow_down"):
+                # Update interval if GitHub asks us to slow down
+                if err == "slow_down":
+                    sess["interval"] = min(sess.get("interval", 5) + 5, 30)
+                return {"status": "pending", "interval": sess["interval"]}
+            if err in ("expired_token", "access_denied"):
+                _copilot_auth_sessions.pop(session_id, None)
+                desc = body.get("error_description", err)
+                return {"status": "error", "error": desc}
+            _copilot_auth_sessions.pop(session_id, None)
+            return {"status": "error", "error": body.get("error_description", err)}
+
+        access_token = body.get("access_token", "")
+        if not access_token:
+            _copilot_auth_sessions.pop(session_id, None)
+            return {"status": "error", "error": "No access_token in response"}
+
+        _copilot_auth_sessions.pop(session_id, None)
+
+        # Auto-create the model endpoint
+        ep_id = str(uuid.uuid4())[:8]
+        base_url = "https://api.githubcopilot.com"
+        model_ids = list(_PROVIDER_CURATED.get("copilot", []))
+        owner = _gcu(request) or None
+
+        db = SessionLocal()
+        try:
+            ep = ModelEndpoint(
+                id=ep_id,
+                name="GitHub Copilot",
+                base_url=base_url,
+                api_key=access_token,
+                is_enabled=True,
+                model_type="llm",
+                cached_models=json.dumps(model_ids) if model_ids else None,
+                supports_tools=True,
+                owner=owner,
+            )
+            db.add(ep)
+            db.commit()
+            _invalidate_models_cache()
+            _local_probe_cache["data"] = None
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(500, f"Failed to create endpoint: {e}")
+        finally:
+            db.close()
+
+        return {"status": "complete", "endpoint_id": ep_id, "name": "GitHub Copilot"}
 
     return router
