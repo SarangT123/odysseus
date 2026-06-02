@@ -44,7 +44,12 @@ A full, hover-to-play tour lives on the landing page (`docs/index.html`).
 
 Defaults work out of the box: clone, run, then configure models/search/email
 inside **Settings**. Only edit `.env` for deployment-level overrides like
-`APP_PORT`, `AUTH_ENABLED`, `DATABASE_URL`, or a pre-seeded admin password.
+`APP_BIND`, `APP_PORT`, `AUTH_ENABLED`, `DATABASE_URL`, or a pre-seeded admin password.
+
+On first setup, Odysseus creates an admin account (`admin` unless
+`ODYSSEUS_ADMIN_USER` is set) and prints a temporary password in the terminal.
+For Docker installs, the same line is in `docker compose logs odysseus`.
+Use that for the first login, then change it in **Settings**.
 
 Contributing? See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, testing, and
 pull request guidelines.
@@ -56,8 +61,10 @@ cd odysseus
 cp .env.example .env       # optional, but recommended for explicit defaults
 docker compose up -d --build
 ```
-Open `http://localhost:7000` when the containers are healthy. If the port is
-taken, set `APP_PORT=7001` in `.env` and recreate the container.
+Open `http://localhost:7000` when the containers are healthy. Docker Compose
+binds the web UI to `127.0.0.1` by default. If the port is taken, set
+`APP_PORT=7001` in `.env` and recreate the container. Set `APP_BIND=0.0.0.0`
+only when you intentionally want LAN/reverse-proxy access.
 
 ### Native Linux / macOS
 ```bash
@@ -67,10 +74,11 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 python setup.py
-python -m uvicorn app:app --host 0.0.0.0 --port 7000
+python -m uvicorn app:app --host 127.0.0.1 --port 7000
 ```
 Requirements: Python 3.11+. Cookbook also needs `tmux` for background model
-downloads and serves.
+downloads and serves. Use `--host 0.0.0.0` only when you intentionally want
+LAN/reverse-proxy access.
 
 ### Apple Silicon
 Docker on macOS cannot use the Metal GPU. For GPU-accelerated Cookbook on an
@@ -82,7 +90,14 @@ cd odysseus
 ./start-macos.sh
 ```
 
-It launches at `http://127.0.0.1:7860`. To build a clickable app wrapper:
+It launches at `http://127.0.0.1:7860`. To expose it to your phone over a trusted LAN/VPN such as Tailscale, bind all interfaces:
+
+```bash
+ODYSSEUS_HOST=0.0.0.0 ./start-macos.sh
+# then open http://<tailscale-ip>:7860
+```
+
+Keep auth enabled when binding outside loopback, and do not expose this port directly to the public internet. To build a clickable app wrapper:
 
 ```bash
 ./build-macos-app.sh
@@ -92,9 +107,9 @@ It launches at `http://127.0.0.1:7860`. To build a clickable app wrapper:
 <summary>Cookbook, GPU, Ollama, and troubleshooting notes</summary>
 
 **Docker bundled services.** Compose starts Odysseus, ChromaDB, SearXNG, and
-ntfy. ChromaDB/SearXNG/ntfy bind host ports to `127.0.0.1` by default, so they
-are reachable from the host but not exposed to your LAN/public internet unless
-you opt in.
+ntfy. Odysseus and the bundled service ports bind to `127.0.0.1` by default, so
+they are reachable from the host but not exposed to your LAN/public internet
+unless you opt in.
 
 **Cookbook storage in Docker.** Downloads live in `./data/huggingface`
 (`~/.cache/huggingface` in the container). Cookbook-installed Python CLIs and
@@ -109,20 +124,64 @@ Odysseus SSH key and add the public key to the remote server's
 ssh-copy-id -i data/ssh/id_ed25519.pub user@server
 ```
 
-**NVIDIA / AMD Docker GPU overlays.** Install the host runtime first, then add
-one of these to `.env`:
+**NVIDIA Docker GPU overlay.** CPU-only users can skip this section.
+`scripts/check-docker-gpu.sh` diagnoses GPU passthrough and can optionally
+install the host runtime or update `.env`. Cookbook can only detect GPUs that
+Docker exposes to the container — if the host runtime is not configured,
+Cookbook sees the iGPU, another card, or CPU instead of your NVIDIA GPU.
+
+```bash
+# Read-only diagnostic (default — installs nothing, never edits .env):
+scripts/check-docker-gpu.sh
+
+# Print OS-specific install commands without running them:
+scripts/check-docker-gpu.sh --print-install-commands
+
+# Install NVIDIA Container Toolkit on Ubuntu/Debian (requires sudo):
+scripts/check-docker-gpu.sh --install-nvidia-toolkit
+
+# Write COMPOSE_FILE to .env (only when GPU passthrough is confirmed working):
+scripts/check-docker-gpu.sh --enable-nvidia-overlay
+
+# Full assisted setup — install toolkit, then enable overlay if passthrough works:
+scripts/check-docker-gpu.sh --install-nvidia-toolkit --enable-nvidia-overlay
+```
+
+Safety notes:
+- The app never installs host GPU runtime automatically.
+- The app never edits `.env` automatically.
+- `.env` is only modified when `--enable-nvidia-overlay` is explicitly passed,
+  and only after GPU passthrough succeeds. `--yes` skips prompts but does not
+  bypass the passthrough gate.
+- `.env.bak.*` backups created by `--enable-nvidia-overlay` are ignored by
+  Git and the Docker build context.
+
+To enable manually without the script, add this to `.env`:
 
 ```bash
 COMPOSE_FILE=docker-compose.yml:docker/gpu.nvidia.yml
+```
+
+**AMD / ROCm.** AMD GPU passthrough is not automated. Add manually:
+
+```bash
 COMPOSE_FILE=docker-compose.yml:docker/gpu.amd.yml
 ```
 
-Verify with:
+Verify after enabling either overlay:
 
 ```bash
-docker compose exec odysseus nvidia-smi -L
-docker compose exec odysseus rocm-smi
+docker compose exec odysseus nvidia-smi -L   # NVIDIA
+docker compose exec odysseus rocm-smi        # AMD
 ```
+
+> **GPU passthrough ≠ llama.cpp CUDA.** `nvidia-smi` passing inside the
+> container confirms Docker GPU access, but llama.cpp also needs `cudart` and
+> the CUDA Toolkit at runtime. If Cookbook logs show `Unable to find cudart
+> library`, `Could NOT find CUDAToolkit`, `CUDA Toolkit not found`, or
+> tensors/layers assigned to CPU, that is a Cookbook/llama.cpp build issue —
+> not a Docker passthrough failure. Re-install the serve engine via
+> **Cookbook → Dependencies** to get a CUDA-enabled build.
 
 **Ollama with Docker.** If Ollama runs on the host, add this endpoint in
 Settings:
@@ -168,12 +227,15 @@ Or do it by hand:
 ```powershell
 git clone https://github.com/pewdiepie-archdaemon/odysseus.git
 cd odysseus
-python -m venv venv
+py -3.11 -m venv venv
 venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python setup.py
 python -m uvicorn app:app --host 127.0.0.1 --port 7000
 ```
+
+If `python` points at an older interpreter, use `py -3.12` (or another installed
+3.11+ version) for the venv step.
 
 **Requirements:** Python 3.11+. The core app (chat, agent, memory, documents,
 email, calendar, deep research) runs fully native. For full **Cookbook** background
@@ -229,6 +291,8 @@ Key settings:
 | `OPENAI_API_KEY` | -- | Optional OpenAI key. Prefer adding providers in the app unless pre-seeding. |
 | `SEARXNG_INSTANCE` | `http://localhost:8080` | SearXNG URL. Docker overrides this to `http://searxng:8080`. |
 | `SEARXNG_SECRET` | generated on first Docker boot | Optional SearXNG cookie/CSRF secret. Leave blank unless you need to pin it. |
+| `APP_BIND` | `127.0.0.1` | Docker Compose host bind address for the web UI. Use `0.0.0.0` only for intentional LAN/reverse-proxy access. |
+| `APP_PORT` | `7000` | Docker Compose host port for the web UI. |
 | `AUTH_ENABLED` | `true` | Enable/disable login |
 | `LOCALHOST_BYPASS` | `false` | Development-only auth bypass for loopback requests. Keep false for shared/network deployments. |
 | `DATABASE_URL` | `sqlite:///./data/app.db` | Database connection string |
