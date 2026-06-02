@@ -299,6 +299,8 @@ def _detect_provider(url: str) -> str:
         return "openrouter"
     if _host_match(url, "groq.com"):
         return "groq"
+    if _host_match(url, "githubcopilot.com"):
+        return "copilot"
     return "openai"
 
 
@@ -327,6 +329,7 @@ def _provider_label(url: str) -> str:
     if _host_match(url, "googleapis.com"): return "Google"
     if _host_match(url, "together.xyz", "together.ai"): return "Together"
     if _host_match(url, "fireworks.ai"): return "Fireworks"
+    if _host_match(url, "githubcopilot.com"): return "GitHub Copilot"
     if _is_ollama_native_url(url): return "Ollama"
     try:
         host = (urlparse(url).hostname or "").lower()

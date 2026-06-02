@@ -744,6 +744,95 @@ function initEndpointForm() {
     return 'http://127.0.0.1:11434/v1';
   }
 
+  // ── GitHub Copilot device auth ──
+  const copilotSection = el('adm-copilot-section');
+  const copilotAuthBtn = el('adm-copilot-auth-btn');
+  const copilotStatus = el('adm-copilot-auth-status');
+
+  function _showCopilotSection(show) {
+    if (!copilotSection) return;
+    copilotSection.classList.toggle('hidden', !show);
+  }
+
+  provider.addEventListener('change', () => {
+    _showCopilotSection(provider.value.includes('githubcopilot.com'));
+  });
+  // Also check on init
+  _showCopilotSection(provider.value.includes('githubcopilot.com'));
+
+  if (copilotAuthBtn) {
+    copilotAuthBtn.addEventListener('click', async () => {
+      copilotAuthBtn.disabled = true;
+      copilotStatus.innerHTML = 'Starting GitHub authorization...';
+      copilotStatus.className = 'adm-ep-inline-msg';
+      try {
+        const startRes = await fetch('/api/copilot-auth/start', {
+          method: 'POST', credentials: 'same-origin',
+        });
+        if (!startRes.ok) {
+          const err = await startRes.json().catch(() => ({}));
+          throw new Error(err.detail || `HTTP ${startRes.status}`);
+        }
+        const { session_id, user_code, verification_uri, interval } = await startRes.json();
+        copilotStatus.innerHTML = `
+          <div style="background:var(--panel-bg);border:1px solid var(--border);border-radius:8px;padding:12px;margin-top:4px;">
+            <div style="font-size:14px;font-weight:600;margin-bottom:8px;">GitHub Device Authorization</div>
+            <div style="margin-bottom:8px;">
+              1. Go to <a href="${verification_uri}" target="_blank" style="font-weight:600;">${verification_uri}</a>
+            </div>
+            <div style="margin-bottom:8px;">
+              2. Enter code: <span style="font-size:22px;font-weight:700;letter-spacing:3px;font-family:monospace;background:var(--accent);color:var(--accent-text);padding:2px 10px;border-radius:4px;">${user_code}</span>
+            </div>
+            <div style="font-size:12px;color:var(--text-dim);">Waiting for authorization…</div>
+            <div class="spinner" style="margin-top:6px;width:18px;height:18px;border-width:2px;"></div>
+          </div>
+        `;
+        copilotStatus.className = '';
+        // Poll for completion
+        let pollInterval = interval || 5;
+        let attempts = 0;
+        const maxAttempts = 120; // 10 min at 5s intervals
+        while (attempts < maxAttempts) {
+          await new Promise(r => setTimeout(r, pollInterval * 1000));
+          attempts++;
+          const pollRes = await fetch('/api/copilot-auth/poll', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id }),
+          });
+          if (!pollRes.ok) {
+            const err = await pollRes.json().catch(() => ({}));
+            throw new Error(err.detail || `HTTP ${pollRes.status}`);
+          }
+          const pollData = await pollRes.json();
+          if (pollData.status === 'complete') {
+            copilotStatus.innerHTML = `<div style="background:var(--accent);color:var(--accent-text);padding:6px 12px;border-radius:6px;font-size:13px;">✓ GitHub Copilot connected! Endpoint created.</div>`;
+            copilotStatus.className = '';
+            // Refresh the endpoints list
+            if (typeof loadEndpoints === 'function') loadEndpoints();
+            // Clear API key input since it's now in the endpoint
+            const apiKeyInput = el('adm-epApiKey');
+            if (apiKeyInput) apiKeyInput.value = '';
+            break;
+          } else if (pollData.status === 'error') {
+            throw new Error(pollData.error);
+          } else {
+            pollInterval = pollData.interval || pollInterval;
+          }
+        }
+        if (attempts >= maxAttempts) {
+          copilotStatus.innerHTML = 'Authorization timed out. Please try again.';
+          copilotStatus.className = 'admin-error';
+        }
+      } catch (e) {
+        copilotStatus.textContent = `Error: ${e.message}`;
+        copilotStatus.className = 'admin-error';
+      } finally {
+        copilotAuthBtn.disabled = false;
+      }
+    });
+  }
+
   function _renderEndpointTestResult(msg, res, d) {
     if (res.ok && d.status === 'empty') {
       msg.textContent = 'Online — no models found';
